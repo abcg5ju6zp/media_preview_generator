@@ -83,14 +83,33 @@ def app_boot_payload(port: int, host: str = "127.0.0.1") -> str:
     before ``config`` is imported, so its ``from dotenv import load_dotenv``
     binds the no-op.
     """
+    # A hard pytest timeout bypasses fixture teardown. Register before importing
+    # the app, and check the original parent in case it died before registration.
+    # prctl is Linux-only; other platforms still use normal fixture teardown.
     return (
+        "import sys\n"
+        "if sys.platform == 'linux':\n"
+        "    import ctypes, os, signal\n"
+        "    libc = ctypes.CDLL(None, use_errno=True)\n"
+        "    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:\n"
+        "        error = ctypes.get_errno()\n"
+        "        raise OSError(error, os.strerror(error))\n"
+        f"    if os.getppid() != {os.getpid()}:\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
         "import dotenv; dotenv.load_dotenv = lambda *a, **k: None; "
-        # PR_SET_PDEATHSIG=SIGKILL: a force-killed pytest (timeout, OOM, Ctrl-C twice) never runs fixture teardown,
-        # which left hundreds of orphaned servers holding gigabytes of RAM.
-        "import ctypes, signal; ctypes.CDLL('libc.so.6').prctl(1, signal.SIGKILL); "
         "from media_preview_generator.web.app import run_server; "
         f"run_server(host='{host}', port={port})"
     )
+
+
+def _stop_app(proc: subprocess.Popen, timeout: float = 5) -> None:
+    """Terminate and reap an app, escalating if its shutdown gets stuck."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
 
 
 def _start_app(config_dir: str, port: int, extra_env: dict | None = None) -> subprocess.Popen:
@@ -109,29 +128,34 @@ def _start_app(config_dir: str, port: int, extra_env: dict | None = None) -> sub
     }
     if extra_env:
         env.update(extra_env)
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            app_boot_payload(port),
-        ],
-        env={**env, "PYTHONPATH": _REPO_ROOT},
-        # Defence in depth behind ``app_boot_payload``'s dotenv patch —
-        # a cwd with no ``.env`` in it.
-        cwd=config_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    log_path = Path(config_dir) / "app-subprocess.log"
+    # Pipes nobody drains can fill during a long E2E run and block the server.
+    # The child owns its copied descriptor after this parent-side file closes.
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", app_boot_payload(port)],
+            env={**env, "PYTHONPATH": _REPO_ROOT},
+            cwd=config_dir,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
     # 60s: under -n auto with 24 workers, the OS scheduler can't give
     # every concurrent Flask boot enough CPU to finish in 30s. Each
     # boot involves GPU detection + JobManager DB load + APScheduler
     # SQLite jobstore + SocketIO + module imports — ~2-3s wall idle,
     # but contention serialises chunks. 60s is enough headroom for
     # 32 workers concurrently while still failing fast on real bugs.
-    if not wait_for_port(port, timeout=60):
-        stdout, stderr = proc.communicate(timeout=5)
-        proc.kill()
-        raise RuntimeError(f"App failed to start on port {port}.\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}")
+    try:
+        ready = wait_for_port(port, timeout=60)
+    except BaseException:
+        _stop_app(proc)
+        raise
+    if not ready:
+        _stop_app(proc)
+        with log_path.open("rb") as log:
+            log.seek(max(0, log_path.stat().st_size - 64 * 1024))
+            output = log.read().decode(errors="replace")
+        raise RuntimeError(f"App failed to start on port {port}.\n{output}")
     return proc
 
 
@@ -144,11 +168,7 @@ def app_url(tmp_path_factory) -> Generator[str, None, None]:
     try:
         yield f"http://localhost:{port}"
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_app(proc)
 
 
 @pytest.fixture(scope="session")
@@ -180,11 +200,7 @@ def app_url_wizard(tmp_path_factory, worker_id) -> Generator[str, None, None]:
     try:
         yield f"http://localhost:{port}"
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_app(proc)
 
 
 @pytest.fixture(autouse=True)
@@ -503,11 +519,7 @@ def backend_real_app(tmp_path_factory, request) -> Generator[tuple[str, str], No
     try:
         yield (f"http://localhost:{port}", str(config_dir))
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_app(proc)
 
 
 @pytest.fixture

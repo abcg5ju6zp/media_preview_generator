@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -31,9 +30,9 @@ from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION
 from tests.e2e.conftest import (
     _build_fake_ffmpeg_path,
     _capture_session_cookie,
-    app_boot_payload,
+    _start_app,
+    _stop_app,
     get_free_port,
-    wait_for_port,
 )
 
 
@@ -82,31 +81,11 @@ def _start_app_for_migration(config_dir: Path, port: int) -> subprocess.Popen:
     seed our values away).
     """
     fake_bin = _build_fake_ffmpeg_path(str(config_dir))
-    env = {
-        **os.environ,
-        "WEB_PORT": str(port),
-        "CONFIG_DIR": str(config_dir),
-        "WEB_AUTH_TOKEN": "e2e-test-token",
+    extra_env = {
         "PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""),
         "CORS_ORIGINS": "*",
     }
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            app_boot_payload(port),
-        ],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if not wait_for_port(port, timeout=20):
-        stdout, stderr = proc.communicate(timeout=5)
-        proc.kill()
-        raise RuntimeError(
-            f"App failed to boot against legacy schema. \nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
-        )
-    return proc
+    return _start_app(str(config_dir), port, extra_env=extra_env)
 
 
 @pytest.mark.e2e
@@ -154,11 +133,7 @@ class TestSchemaMigrationBoot:
             assert cookie is not None
 
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _stop_app(proc)
 
     def test_boot_with_v6_settings_promotes_legacy_plex_keys_into_media_servers(
         self,
@@ -220,11 +195,7 @@ class TestSchemaMigrationBoot:
             )
 
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _stop_app(proc)
 
     def test_boot_with_already_current_schema_is_a_noop(
         self,
@@ -260,8 +231,4 @@ class TestSchemaMigrationBoot:
                 "The migration is re-running every boot."
             )
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _stop_app(proc)
