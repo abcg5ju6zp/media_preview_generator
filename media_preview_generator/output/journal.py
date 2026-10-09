@@ -286,6 +286,69 @@ def get_plex_refresh_pending(
     return None
 
 
+#: Classification results for :func:`classify_plex_refresh_marker`. The
+#: durable Plex refresh backlog uses them at startup and before every retry to
+#: decide whether a persisted todo still corresponds to the outputs on disk.
+MARKER_CURRENT = "current"
+MARKER_SUPERSEDED = "superseded"
+MARKER_CLEARED = "cleared"
+MARKER_OUTPUT_MISSING = "output_missing"
+
+
+def classify_plex_refresh_marker(
+    output_paths: list[Path],
+    canonical_path: str,
+    server_id: str,
+    token: str,
+    *,
+    source_fingerprint: SourceFingerprint | None = None,
+) -> str:
+    """Classify a persisted notification marker against today's outputs.
+
+    Purely read-only — the caller (durable refresh backlog) owns the decision
+    about which record to retire and must never acknowledge a publication it
+    did not itself see accepted, so this helper only reports state; it never
+    writes.
+
+    Returns:
+        :data:`MARKER_CURRENT` when at least one existing, non-empty output's
+        journal still carries the exact marker (source fingerprint and
+        token). When the source cannot be stat'd, the globally-unique token
+        alone identifies the publication.
+
+        :data:`MARKER_SUPERSEDED` when the exact marker is gone but an
+        existing output still carries *another* marker for the same
+        ``(source, server)`` — a newer publication replaced this one. The
+        caller retires its own record without touching the newer marker.
+
+        :data:`MARKER_CLEARED` when the outputs and their journals still
+        exist but carry no marker for this ``(source, server)`` — the
+        Analyze was already acknowledged, or the journal was rewritten.
+
+        :data:`MARKER_OUTPUT_MISSING` when none of the recorded outputs
+        exists with content any more.
+    """
+    try:
+        fingerprint = source_fingerprint or get_source_fingerprint(canonical_path)
+    except OSError:
+        fingerprint = None
+    existing = [output for output in output_paths if _has_content(output)]
+    if not existing:
+        return MARKER_OUTPUT_MISSING
+    saw_related = False
+    with _WRITE_LOCK:
+        for output in existing:
+            for entry in _pending_refreshes(_read_meta(_meta_path_for(output)) or {}):
+                if entry.get("path") != canonical_path or entry.get("server_id") != server_id:
+                    continue
+                if entry.get("token") == token and (
+                    fingerprint is None or entry.get("source_fingerprint") == list(fingerprint)
+                ):
+                    return MARKER_CURRENT
+                saw_related = True
+    return MARKER_SUPERSEDED if saw_related else MARKER_CLEARED
+
+
 def clear_plex_refresh_pending(
     output_paths: list[Path],
     canonical_path: str,

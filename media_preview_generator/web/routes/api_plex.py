@@ -16,6 +16,34 @@ PLEX_HEADERS = {
 }
 
 
+@api.route("/plex/refresh-backlog")
+@setup_or_auth_required
+def get_plex_refresh_backlog():
+    """Report durable Plex Analyze todos the background worker is still chasing.
+
+    Read-only observability for the backlog that outlives the in-memory
+    notification queue: active todos (with per-server pause state, attempts,
+    next retry and last failure), terminal todos grouped by reason
+    (superseded publications, deleted servers, vanished outputs, replaced
+    sources), and whether the JSON store is currently persisted to disk.
+    """
+    from ...processing.plex_refresh import _queue
+
+    backlog = _queue._backlog  # noqa: SLF001 - same package family, read-only view
+    if backlog is None:
+        return jsonify(
+            {
+                "active": [],
+                "counts": {"active": 0, "paused": 0},
+                "paused_server_ids": [],
+                "terminated": {},
+                "terminated_recent": [],
+                "disk_persisted": True,
+            }
+        )
+    return jsonify(backlog.snapshot())
+
+
 @api.route("/plex/auth/pin", methods=["POST"])
 @setup_or_auth_required
 def create_plex_pin():

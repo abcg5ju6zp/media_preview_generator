@@ -783,6 +783,22 @@ def create_app(config_dir: str | None = None) -> Flask:
 
     run_migrations(sm)
 
+    # Start the durable Plex Analyze backlog. The immediate notification queue
+    # only keeps unconfirmed Analyze requests in memory; without this backlog a
+    # full queue, a temporarily offline Plex, or a restart would leave published
+    # previews unadvertised until some later job happens to touch the same file.
+    # The backlog reloads only todos whose output journals still carry the
+    # exact publication token and keeps retrying, paced per configured server.
+    try:
+        from ..processing.plex_refresh import configure_plex_refresh_backlog
+
+        configure_plex_refresh_backlog(config_dir)
+    except Exception:
+        logger.exception(
+            "Could not start the durable Plex refresh backlog; saved previews still get the immediate "
+            "Analyze attempt, but unconfirmed notifications won't be retried in the background"
+        )
+
     # Create the SocketIO log broadcaster so the live /logs page can stream
     # log messages in real time.  Must be registered before setup_logging().
     from ..logging_config import (
