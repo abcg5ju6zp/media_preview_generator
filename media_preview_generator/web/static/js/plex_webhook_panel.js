@@ -120,6 +120,17 @@ function applyPlexWebhookStatus(data) {
         if (regSpan) regSpan.textContent = 'Register with Plex';
         unregisterBtn.classList.add('d-none');
     }
+
+    // Surface an in-flight webhook-secret rotation on this server: the
+    // badge shows the generation-level state and the registration buttons
+    // arbitrate with the rotation (new-secret URL only; old kept).
+    if (data.rotation && data.rotation.active) {
+        badge.className = 'badge badge-status bg-warning text-dark';
+        const phase = data.rotation.new_url_confirmed
+            ? 'rotation: removing old URL…'
+            : 'rotation: registering new URL…';
+        badge.textContent = phase + ' (gen ' + data.rotation.generation + ')';
+    }
 }
 
 function resetPlexWebhookUrl() {

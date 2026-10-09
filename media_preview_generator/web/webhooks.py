@@ -208,12 +208,30 @@ def _authenticate_webhook(f):
         settings = get_settings_manager()
         webhook_secret = settings.get("webhook_secret", "")
 
+        # During a multi-server secret rotation, every secret in the
+        # round's legacy chain still authenticates until the bounded
+        # grace window closes (or every enabled Plex converges — see
+        # secret_rotation.RotationManager). The predicate is a cheap
+        # in-memory read of the persisted round and never widens auth
+        # unless the round's new secret is still the configured one.
+        def _legacy_secret_accepted(candidate_token: str) -> bool:
+            try:
+                from .secret_rotation import get_rotation_manager
+
+                return get_rotation_manager().accepts_secret(candidate_token)
+            except Exception:
+                logger.debug("Rotation secret check failed; treating token as non-legacy", exc_info=True)
+                return False
+
         # The inbound URL may carry ?server_id=<id> for routing (Plex Direct
         # registrations embed it so the dispatcher knows which configured
         # Plex sent the event). Auth itself uses only the global webhook
-        # secret, then falls back to the API auth token.
+        # secret, then a still-in-grace rotation secret, then falls back
+        # to the API auth token.
         for _method, token in candidates:
             if webhook_secret and secrets.compare_digest(token, webhook_secret):
+                return f(*args, **kwargs)
+            if _legacy_secret_accepted(token):
                 return f(*args, **kwargs)
             if validate_token(token):
                 return f(*args, **kwargs)

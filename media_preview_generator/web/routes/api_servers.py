@@ -63,6 +63,58 @@ def _save_media_servers(servers: list[dict]) -> None:
     get_settings_manager().set("media_servers", servers)
 
 
+def _settle_rotation_on_disable(server_id: str) -> None:
+    """Deterministically remove a disabled server's rotation pending (never raises)."""
+    try:
+        from ..secret_rotation import S_RESOLVED_DISABLED, get_rotation_manager
+
+        get_rotation_manager().resolve_server(server_id, S_RESOLVED_DISABLED)
+    except Exception:
+        logger.debug("Rotation settle after server disable failed (non-fatal)", exc_info=True)
+
+
+def _rejoin_or_ensure_webhook_on_enable(entry: dict) -> None:
+    """Re-enable hook: rejoin a live rotation or idempotently ensure the current URL.
+
+    With an active rotation the server re-enters the current generation
+    and the convergence worker verifies the new-secret URL remotely.
+    Without one, perform one best-effort idempotent registration using
+    the current webhook secret (or API token fallback) so a Plex that
+    was disabled for a while doesn't keep an outdated ?token= URL.
+    """
+    server_id = str(entry.get("id") or "")
+    if (entry.get("type") or "").lower() != "plex" or not server_id:
+        return
+    try:
+        from ..secret_rotation import get_rotation_manager
+
+        manager = get_rotation_manager()
+        if manager.reenable_server(server_id):
+            return
+    except Exception:
+        logger.debug("Rotation rejoin after server enable failed (non-fatal)", exc_info=True)
+
+    token = str((entry.get("auth") or {}).get("token") or entry.get("token") or "").strip()
+    public_url = str((entry.get("output") or {}).get("webhook_public_url") or "").strip()
+    if not token or not public_url:
+        return
+    try:
+        from .. import plex_webhook_registration as pwh
+        from .api_plex_webhook import _plex_webhook_auth_token
+
+        auth_token = _plex_webhook_auth_token()
+        if auth_token:
+            pwh.register(token, public_url, auth_token=auth_token)
+            logger.info("Re-registered Plex webhook after server re-enable: {}", entry.get("name") or server_id)
+    except Exception:
+        logger.warning(
+            "Could not ensure the Plex webhook registration after re-enabling server {!r}. "
+            "Use Re-register with Plex from the server editor if its events stop arriving.",
+            entry.get("name") or server_id,
+            exc_info=True,
+        )
+
+
 def _is_disabled(target: dict) -> bool:
     """True when the persisted media-servers entry is disabled.
 
@@ -821,6 +873,16 @@ def create_server():
     _save_media_servers(servers)
     logger.info("Added media server {!r} (id={})", entry["name"], entry["id"])
 
+    # A new enabled Plex joins any in-flight secret rotation; the worker
+    # may have gone idle (no due targets) and needs a wake.
+    if (entry.get("type") or "").lower() == "plex" and entry.get("enabled", True) is not False:
+        try:
+            from ..secret_rotation import get_rotation_manager
+
+            get_rotation_manager().kick()
+        except Exception:
+            logger.debug("Rotation kick after server create failed (non-fatal)", exc_info=True)
+
     return (
         jsonify(
             {
@@ -865,6 +927,18 @@ def update_server(server_id: str):
             servers[i] = updated
             _save_media_servers(servers)
             logger.info("Updated media server {!r} (id={})", updated["name"], server_id)
+            # A new token/URL/public webhook URL changes the rotation
+            # target for this server — make the worker re-list remotely.
+            public_url_changed = (updated.get("output") or {}).get("webhook_public_url") != (
+                entry.get("output") or {}
+            ).get("webhook_public_url")
+            if (updated.get("type") or "").lower() == "plex" and (url_changed or auth_changed or public_url_changed):
+                try:
+                    from ..secret_rotation import get_rotation_manager
+
+                    get_rotation_manager().kick()
+                except Exception:
+                    logger.debug("Rotation kick after server update failed (non-fatal)", exc_info=True)
             return jsonify(
                 {
                     **server_config_to_dict(server_config_from_dict(updated)),
@@ -920,6 +994,18 @@ def delete_server(server_id: str):
 
     _save_media_servers(new_servers)
     logger.info("Removed media server id={}", server_id)
+
+    # Deterministically settle any in-flight rotation pending for this
+    # server so it can't block old-secret revocation forever. Done AFTER
+    # the settings write: the worker would reconcile it on its next pass
+    # anyway, but the delete contract is "settled now".
+    try:
+        from ..secret_rotation import S_RESOLVED_DELETED, get_rotation_manager
+
+        get_rotation_manager().resolve_server(server_id, S_RESOLVED_DELETED)
+    except Exception:
+        logger.debug("Rotation settle after server delete failed (non-fatal)", exc_info=True)
+
     return jsonify({"deleted": server_id})
 
 
@@ -1386,6 +1472,14 @@ def set_server_enabled(server_id: str):
     updated[target_index] = entry
     settings.set("media_servers", updated)
     logger.info("Server {!r} enabled={}", entry.get("name") or server_id, payload["enabled"])
+
+    # Arbitrate with an in-flight secret rotation: disabling settles the
+    # server's pending deterministically; re-enabling rejoins the round
+    # (or idempotently re-ensures the current-secret webhook URL).
+    if payload["enabled"] is False:
+        _settle_rotation_on_disable(server_id)
+    else:
+        _rejoin_or_ensure_webhook_on_enable(entry)
 
     return jsonify({"server_id": server_id, "enabled": payload["enabled"]})
 

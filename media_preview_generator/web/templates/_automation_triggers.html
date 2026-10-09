@@ -416,6 +416,21 @@
                     </div>
                 </div>
 
+                <!-- Secret rotation progress: populated by secret_rotation_panel.js;
+                     hidden unless a rotation round is active. Never displays secrets. -->
+                <div id="secretRotationPanel" class="d-none mt-3 p-3 rounded border">
+                    <div class="d-flex align-items-center flex-wrap gap-2 mb-2">
+                        <h6 class="mb-0"><i class="bi bi-arrow-repeat me-1"></i>Webhook secret rotation</h6>
+                        <span id="secretRotationGeneration" class="badge bg-secondary"></span>
+                        <span id="secretRotationBadge" class="badge"></span>
+                        <button class="btn btn-sm btn-outline-secondary ms-auto" type="button" id="secretRotationRetryBtn">
+                            <i class="bi bi-arrow-clockwise me-1"></i>Retry failed servers
+                        </button>
+                    </div>
+                    <p class="small text-muted mb-2" id="secretRotationSummary"></p>
+                    <ul class="list-unstyled small mb-0" id="secretRotationServers"></ul>
+                </div>
+
                 <p class="help mb-0 pt-3">
                     Retry and queue settings moved to <a href="{{ url_for('main.settings') }}#section-processing">Settings &rarr; Processing</a>. <button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Those controls apply to every job type, not just webhooks." data-explain-title="Moved controls" data-explain-template="infoMovedControlsTpl"><i class="bi bi-info-circle"></i></button>
 <template id="infoMovedControlsTpl">
@@ -439,6 +454,7 @@
         </div>
 
 <script src="{{ url_for('static', filename='js/plex-auth.js') }}"></script>
+<script src="{{ url_for('static', filename='js/secret_rotation_panel.js') }}"></script>
 <script>
 // Per-server webhook scoping: when set, the user is publishing to one
 // configured server only. We append ?server_id=<id> to the visible URLs

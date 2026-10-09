@@ -965,8 +965,26 @@ def create_app(config_dir: str | None = None) -> Flask:
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         return response
 
-    # Auto-requeue jobs that were interrupted by the server restart. Kept ahead of schedule ticks; leftover Intro &
-    # Credits jobs that aren't revived are settled by fail_unrevived_interrupted_jobs, so no tick skips on them.
+    # Resume an in-flight webhook secret rotation: keep accepting the old
+    # secret within its grace window and continue reconciling every enabled
+    # Plex server from the persisted round state. Must run before the app
+    # serves traffic so the first post-restart webhook auths correctly.
+    try:
+        from .secret_rotation import get_rotation_manager
+
+        rotation_manager = get_rotation_manager(config_dir)
+        rotation_manager.resume_on_startup()
+        atexit.register(rotation_manager.shutdown)
+    except Exception:
+        logger.warning(
+            "Could not resume webhook secret rotation state at startup; "
+            "only the currently configured webhook secret will authenticate inbound webhooks.",
+            exc_info=True,
+        )
+
+    # Auto-requeue jobs that were running or pending when the server last stopped. Kept ahead of schedule ticks;
+    # leftover Intro & Credits jobs that aren't revived are settled by fail_unrevived_interrupted_jobs, so no tick
+    # skips on them.
     _requeue_interrupted_on_startup(config_dir)
 
     # Start scheduler

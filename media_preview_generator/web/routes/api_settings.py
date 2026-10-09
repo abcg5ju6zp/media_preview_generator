@@ -671,17 +671,18 @@ def _validate_and_coerce_settings_updates(
     return updates, None
 
 
-def _reregister_plex_webhooks_after_secret_rotation(settings) -> None:
-    """Re-register every Plex server's direct webhook so Plex picks up the new token.
+def _reregister_plex_webhooks_first_secret(settings) -> None:
+    """Best-effort Plex registration when a webhook secret is set for the FIRST time.
 
-    Rotating ``webhook_secret`` invalidates the ``?token=`` query embedded in
-    every previously-registered Plex webhook URL. Without re-registering, Plex
-    Media Server keeps posting with the stale token and we silently start
-    rejecting all of its events.
+    With no previous secret there is no old registration to protect and no
+    dual-auth window to manage — every enabled Plex with a token and stored
+    ``webhook_public_url`` is simply registered with the new secret once.
+    Subsequent changes go through the recoverable rotation orchestrator
+    (:mod:`media_preview_generator.web.secret_rotation`) instead, which keeps
+    the old secret valid while every Plex converges remotely.
 
-    Best-effort per server — one failed registration shouldn't block the
-    others or the save itself. Each failure logs a tracback so the operator
-    can re-register manually from Servers → Edit → Webhook & Scanner.
+    Best-effort per server — one failed registration doesn't block the
+    others or the save itself.
     """
     try:
         from .. import plex_webhook_registration as pwh
@@ -722,7 +723,13 @@ def _reregister_plex_webhooks_after_secret_rotation(settings) -> None:
         )
 
 
-def _apply_post_save_hooks(settings, updates: dict, incoming_field_keys: set[str]) -> dict:
+def _apply_post_save_hooks(
+    settings,
+    updates: dict,
+    incoming_field_keys: set[str],
+    *,
+    previous_webhook_secret: str = "",
+) -> dict:
     """Run side-effects that fire after settings.update() persists the change.
 
     Hooks (in apply order):
@@ -739,9 +746,10 @@ def _apply_post_save_hooks(settings, updates: dict, incoming_field_keys: set[str
        token, verify_ssl), invalidate the cached library list. Uses
        ``incoming_field_keys`` rather than ``updates`` so the hook still
        fires when those fields get re-routed into ``media_servers[0]``.
-    4. **Webhook secret rotation** — if ``webhook_secret`` changed, re-
-       register every Plex server's direct webhook so PMS picks up the
-       new token (otherwise it keeps posting with the stale token).
+    4. **Webhook secret rotation** — a changed ``webhook_secret`` opens a
+       recoverable multi-server rotation round (old secret stays valid
+       until every enabled Plex confirms the new URL); the very first
+       secret instead gets one best-effort registration pass.
     5. **Logging reconfiguration** — if any log_* field changed, rebuild
        the loguru handlers with the new level/rotation/retention.
     6. **Thumbnail interval propagation** — if ``thumbnail_interval`` changed,
@@ -800,7 +808,24 @@ def _apply_post_save_hooks(settings, updates: dict, incoming_field_keys: set[str
         clear_library_cache()
 
     if "webhook_secret" in updates:
-        _reregister_plex_webhooks_after_secret_rotation(settings)
+        new_secret = str(updates.get("webhook_secret") or "").strip()
+        if previous_webhook_secret and new_secret and previous_webhook_secret != new_secret:
+            # Recoverable rotation: the old secret keeps authenticating
+            # inbound webhooks until the bounded grace window closes (and
+            # the worker reconciles every enabled Plex remotely).
+            try:
+                from ..secret_rotation import get_rotation_manager
+
+                get_rotation_manager().begin_rotation(previous_webhook_secret, new_secret)
+            except Exception:
+                logger.warning(
+                    "Could not start the webhook secret rotation round. "
+                    "The new secret is saved; re-open Settings and rotate again if Plex "
+                    "webhooks stop arriving.",
+                    exc_info=True,
+                )
+        elif not previous_webhook_secret:
+            _reregister_plex_webhooks_first_secret(settings)
 
     log_fields = {"log_level", "log_rotation_size", "log_retention_count"}
     if log_fields & updates.keys():
@@ -949,11 +974,23 @@ def save_settings():
         body, status = error_response
         return body, status
 
+    # Saving the SAME webhook secret (whitespace-only difference included)
+    # must be a complete no-op: no new rotation generation, no plex.tv
+    # traffic, and the field shouldn't even round-trip through settings.
+    # The masked "****"/empty cases were already dropped during validation.
+    previous_webhook_secret = str(settings.get("webhook_secret") or "").strip()
+    if "webhook_secret" in updates:
+        candidate_secret = str(updates["webhook_secret"] or "").strip()
+        if candidate_secret and candidate_secret != previous_webhook_secret:
+            updates["webhook_secret"] = candidate_secret
+        else:
+            updates.pop("webhook_secret", None)
+
     # Route Plex-flavoured legacy fields into media_servers[0] instead of
     # writing them as top-level keys. Phase 0 already taught readers to
     # prefer the per-server view; this is the write half of the same flip.
     # Capture which fields the *caller* tried to update before we strip
-    # them, so the post-save hooks (cache invalidation, webhook re-register)
+    # them, so the post-save hooks (cache invalidation, webhook rotation)
     # still fire even though the keys ended up nested under media_servers.
     incoming_field_keys = set(updates.keys())
     updates, new_media_servers = _route_legacy_plex_fields_into_media_servers(settings, updates)
@@ -969,7 +1006,14 @@ def save_settings():
                 return jsonify({"error": str(exc)}), 400
             settings.update(updates)
         logger.info("Settings updated: {}", list(updates.keys()))
-        result.update(_apply_post_save_hooks(settings, updates, incoming_field_keys))
+        result.update(
+            _apply_post_save_hooks(
+                settings,
+                updates,
+                incoming_field_keys,
+                previous_webhook_secret=previous_webhook_secret,
+            )
+        )
     return jsonify(result)
 
 

@@ -231,6 +231,18 @@ def plex_webhook_status():
                 has_pass = None
             registered = False
 
+    # Non-sensitive rotation snippet for this server (generation / state /
+    # two-phase booleans) so the server editor badge can reflect an
+    # in-flight secret rotation. Never carries the secret itself.
+    rotation = None
+    if server_entry:
+        try:
+            from ..secret_rotation import get_rotation_manager
+
+            rotation = get_rotation_manager().get_server_generation(str(server_entry.get("id") or ""))
+        except Exception:
+            logger.debug("Rotation status lookup failed (non-fatal)", exc_info=True)
+
     return jsonify(
         {
             "server_id": server_entry.get("id") if server_entry else None,
@@ -242,6 +254,7 @@ def plex_webhook_status():
             "error": error,
             "error_reason": error_reason,
             "warning": _loopback_in_docker_warning(public_url),
+            "rotation": rotation,
         }
     )
 
@@ -308,6 +321,37 @@ def plex_webhook_register():
     source_url = raw_url or stored_url
     public_url = _rebuild_path_preserving_host(source_url, registered_server_id)
 
+    # During a secret rotation the legacy register() (which deletes every
+    # same-base variant) would rip out the still-working old-token URL
+    # before the new one is confirmed. The rotation manager performs the
+    # arbitration-safe half ("make sure the new URL exists") and leaves
+    # old-URL removal to its convergence worker. Outside a rotation this
+    # returns None and the regular register() path runs unchanged.
+    from ..secret_rotation import get_rotation_manager
+
+    try:
+        arbitration = get_rotation_manager().manual_register(registered_server_id)
+    except pwh.PlexWebhookError as exc:
+        status_code = 400 if exc.reason in ("missing_url", "missing_token") else 502
+        if exc.reason == "plex_pass_required":
+            status_code = 403
+        return (
+            jsonify({"success": False, "error": str(exc), "reason": exc.reason}),
+            status_code,
+        )
+
+    if arbitration is not None:
+        _persist_server_webhook_url(server_entry, public_url)
+        return jsonify(
+            {
+                "success": True,
+                "server_id": registered_server_id,
+                "registered_in_plex": True,
+                "public_url": public_url,
+                "rotation": arbitration,
+            }
+        )
+
     try:
         # No ``server_id=`` kwarg: the per-server path already encodes
         # it (``/api/webhooks/server/<id>``). Passing it would land a
@@ -350,6 +394,33 @@ def plex_webhook_unregister():
 
     token = _server_token(server_entry)
     public_url = _server_webhook_url(server_entry)
+
+    # Rotation arbitration: remove BOTH the current-secret and any
+    # legacy-secret URLs and settle this server's round pending. Outside
+    # an active round the call returns None and normal unregister runs.
+    from ..secret_rotation import get_rotation_manager
+
+    try:
+        arbitration = get_rotation_manager().manual_unregister(server_entry.get("id")) if server_entry else None
+    except pwh.PlexWebhookError as exc:
+        logger.warning(
+            "Could not remove the Plex webhook registration on plex.tv during rotation ({}). "
+            "The rotation pending for this server is kept until removal succeeds.",
+            exc,
+        )
+        return (
+            jsonify({"success": False, "error": str(exc), "reason": exc.reason}),
+            502,
+        )
+    if arbitration is not None:
+        return jsonify(
+            {
+                "success": True,
+                "server_id": server_entry.get("id") if server_entry else None,
+                "registered_in_plex": False,
+                "rotation": arbitration,
+            }
+        )
 
     if token:
         try:
