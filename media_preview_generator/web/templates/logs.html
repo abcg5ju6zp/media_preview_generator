@@ -20,6 +20,22 @@
             <button type="button" class="log-ibtn" id="logDownloadBtn" aria-label="Download logs" title="Download logs"><i class="bi bi-download"></i></button>
         </div>
     </header>
+    <section class="card mb-3" id="process-cleanup" hidden aria-label="Process cleanup">
+        <div class="d-flex align-items-center justify-content-between p-2">
+            <div>
+                <h2 class="h6 mb-0"><i class="bi bi-shield-exclamation me-1"></i>Process cleanup</h2>
+                <div class="small text-muted" id="processCleanupSub">
+                    Residual frame-extraction processes or temp directories after a restart.
+                </div>
+            </div>
+            <div>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="processCleanupRecheck">
+                    <i class="bi bi-arrow-repeat me-1"></i>Recheck all
+                </button>
+            </div>
+        </div>
+        <ul class="list-group list-group-flush" id="processCleanupList"></ul>
+    </section>
     <section class="log-toolbar card" aria-label="Log filters">
         <div class="log-seg" role="group" aria-label="Minimum level to show">
             <button type="button" class="log-level-btn" data-level="DEBUG">Debug</button>
@@ -605,6 +621,94 @@
         await loadInitialHistory();
         connectSocket();
     })();
+})();
+</script>
+
+<script>
+/* Process-cleanup panel: open orphan-reconciliation TODOs with recheck/dismiss. */
+(function() {
+    const card = document.getElementById('process-cleanup');
+    const list = document.getElementById('processCleanupList');
+    const sub = document.getElementById('processCleanupSub');
+    const recheckBtn = document.getElementById('processCleanupRecheck');
+    if (!card || !list) return;
+
+    const KIND_LABEL = {
+        graceful_terminate_timeout: "Didn't stop in time",
+        kill_failed: "Survived forced stop",
+        cleanup_failed: "Temp directory left behind",
+        identity_unconfirmed: "Identity could not be confirmed",
+    };
+
+    function csrfHeaders() {
+        const meta = document.querySelector('meta[name="csrf-token"]');
+        return { 'X-CSRFToken': meta ? meta.getAttribute('content') : '' };
+    }
+
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    function row(todo) {
+        const li = document.createElement('li');
+        li.className = 'list-group-item d-flex align-items-start justify-content-between gap-2 py-2';
+        const kind = KIND_LABEL[todo.kind] || todo.kind;
+        const bits = [kind];
+        if (todo.pid) bits.push('pid ' + todo.pid);
+        if (todo.job_id) bits.push('job ' + todo.job_id);
+        const path = (todo.paths && (todo.paths.path || todo.paths.output_folder)) || '';
+        const main = document.createElement('div');
+        main.innerHTML =
+            '<div class="small"><strong>' + esc(bits.join(' · ')) + '</strong></div>' +
+            (path ? '<div class="small text-muted">' + esc(path) + '</div>' : '') +
+            (todo.detail ? '<div class="small text-muted">' + esc(todo.detail) + '</div>' : '');
+        const actions = document.createElement('div');
+        actions.className = 'text-nowrap';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-outline-secondary';
+        btn.textContent = 'Dismiss';
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            await fetch('/api/system/process-cleanup/' + encodeURIComponent(todo.id) + '/resolve', {
+                method: 'POST',
+                headers: csrfHeaders(),
+            });
+            load();
+        });
+        actions.appendChild(btn);
+        li.appendChild(main);
+        li.appendChild(actions);
+        return li;
+    }
+
+    async function load() {
+        try {
+            const resp = await fetch('/api/system/process-cleanup');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const todos = data.todos || [];
+            list.replaceChildren(...todos.map(row));
+            card.hidden = todos.length === 0;
+            if (todos.length) {
+                sub.textContent = todos.length + ' open item(s) — recheck reclaims live orphans and clears resolved items.';
+            }
+        } catch {}
+    }
+
+    recheckBtn.addEventListener('click', async () => {
+        recheckBtn.disabled = true;
+        try {
+            await fetch('/api/system/process-cleanup/reconcile', { method: 'POST', headers: csrfHeaders() });
+            await load();
+        } finally {
+            recheckBtn.disabled = false;
+        }
+    });
+
+    load();
 })();
 </script>
 {% endblock %}

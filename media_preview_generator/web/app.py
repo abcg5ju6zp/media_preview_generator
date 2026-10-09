@@ -9,6 +9,7 @@ import hmac
 import json
 import logging  # stdlib logging only — required to mute werkzeug's own logger; app code must use loguru
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -489,6 +490,61 @@ def _fail_unrevived_preview_jobs() -> None:
         )
 
 
+_process_claim_hook_registered = False
+
+
+def _register_process_claim_shutdown(config_dir: str) -> None:
+    """Configure the process-claim store and converge owned FFmpeg on exit.
+
+    A supervisor restart (s6 re-running the web service) or a gunicorn
+    graceful exit used to leave extraction FFmpeg reparented to PID 1, still
+    holding GPU/CPU and the frame temp directories. The atexit hook gives
+    every owned child a bounded SIGCONT→SIGTERM→SIGKILL convergence
+    (inside gunicorn's 30 s graceful window); anything unconfirmed keeps an
+    active claim plus a TODO and is reconciled at the next boot.
+
+    Under gunicorn the arbiter owns SIGTERM — we rely on atexit during the
+    worker's graceful finalization and do not touch its signal handlers.
+    Standalone (``python -m ...app``) installs a small chained handler so the
+    dev server converges children before the default disposition exits.
+    """
+    try:
+        from ..processing.process_claims import configure_claims, shutdown_all_claims
+
+        configure_claims(config_dir)
+        import atexit as _atexit
+
+        global _process_claim_hook_registered
+        if not _process_claim_hook_registered:
+            _atexit.register(shutdown_all_claims)
+
+            if "gunicorn" not in sys.modules:
+                # Gunicorn owns SIGTERM/SIGINT for its worker graceful
+                # finalisation; only chain them for a standalone (dev) server.
+                import signal as _signal
+
+                def _converge_then_default(signum, _frame):
+                    try:
+                        shutdown_all_claims()
+                    except Exception:
+                        logger.debug("shutdown convergence failed", exc_info=True)
+                    _signal.signal(signum, _signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+
+                for _name in ("SIGTERM", "SIGINT"):
+                    _sig = getattr(_signal, _name, None)
+                    if _sig is None:
+                        continue
+                    try:
+                        _signal.signal(_sig, _converge_then_default)
+                    except (ValueError, OSError):
+                        # Not in the main thread or platform restriction: atexit remains the safety net.
+                        pass
+            _process_claim_hook_registered = True
+    except Exception:
+        logger.exception("Could not register the process-claim shutdown hook")
+
+
 def _requeue_interrupted_on_startup(config_dir: str) -> None:
     """Revive jobs that were running or pending when the server last stopped.
 
@@ -965,6 +1021,17 @@ def create_app(config_dir: str | None = None) -> Flask:
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         return response
 
+    # Reclaim extraction FFmpeg orphaned by a previous boot BEFORE the job
+    # requeue, so a revived job's GPU/CPU and frame dirs are actually free.
+    # Signalling is default-deny (start-ticks + token + argv-hash checks);
+    # failures only create observable TODOs and never block startup.
+    try:
+        from ..processing.process_claims import recover_orphaned_processes
+
+        recover_orphaned_processes(config_dir)
+    except Exception:
+        logger.exception("Orphan-process recovery failed; continuing with job recovery")
+
     # Auto-requeue jobs that were interrupted by the server restart. Kept ahead of schedule ticks; leftover Intro &
     # Credits jobs that aren't revived are settled by fail_unrevived_interrupted_jobs, so no tick skips on them.
     _requeue_interrupted_on_startup(config_dir)
@@ -984,6 +1051,11 @@ def create_app(config_dir: str | None = None) -> Flask:
             logger.debug("Scheduler shutdown error during exit", exc_info=True)
 
     atexit.register(_shutdown_scheduler)
+
+    # Converge owned extraction FFmpeg processes on exit and configure the
+    # persistent claim store at this boot's config dir (orphan recovery runs
+    # before the job requeue below).
+    _register_process_claim_shutdown(config_dir)
 
     # Log token on startup
     log_token_on_startup()

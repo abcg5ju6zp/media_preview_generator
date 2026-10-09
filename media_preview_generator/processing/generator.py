@@ -1503,6 +1503,8 @@ def generate_images(
     ffmpeg_threads_override: int | None = None,
     cancel_check=None,
     pause_check=None,
+    claim_context=None,
+    ephemeral_output: bool = False,
 ) -> tuple[bool, int, str, float, float, str | None]:
     """Generate thumbnail images from ``video_file`` using FFmpeg.
 
@@ -1741,6 +1743,8 @@ def generate_images(
         base_scale=base_scale,
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
+        claim_context=claim_context,
+        ephemeral_output=ephemeral_output,
     )
 
     # DV Profile 5 paths cannot use -skip_frame (RPU side-data has
@@ -2222,7 +2226,7 @@ def generate_images(
     return success, image_count, hw, seconds, speed, error_summary
 
 
-def _cleanup_temp_directory(tmp_path: str) -> None:
+def _cleanup_temp_directory(tmp_path: str, job_id: str | None = None) -> None:
     """Clean up temporary directory, logging warnings on failure.
 
     Args:
@@ -2244,6 +2248,19 @@ def _cleanup_temp_directory(tmp_path: str) -> None:
             tmp_path,
             cleanup_error,
         )
+        # Persist an observable cleanup TODO (bell/API) so the leftover folder
+        # does not rely on this log line alone. Never block processing on it.
+        try:
+            from .process_claims import TODO_CLEANUP_FAILED, get_claims_store
+
+            get_claims_store().add_todo(
+                TODO_CLEANUP_FAILED,
+                job_id=job_id or None,
+                paths={"path": tmp_path},
+                detail=f"{type(cleanup_error).__name__}: {cleanup_error}",
+            )
+        except Exception:
+            logger.debug("Could not record the temp-folder cleanup TODO for {}", tmp_path, exc_info=True)
 
 
 def _bif_temp_path(bif_filename: str) -> str:

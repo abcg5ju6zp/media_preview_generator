@@ -42,6 +42,16 @@ from .filter_chain import (
     DV5_PATH_VAAPI_VULKAN,
 )
 from .hwaccel import hwaccel_decode_args
+from .process_claims import (
+    CLAIM_ENV_VAR,
+    TODO_KILL_FAILED,
+    ClaimContext,
+    ClaimPersistError,
+    current_claim_context,
+    get_claims_store,
+    get_process_group,
+    new_claim_token,
+)
 
 # Added to the stderr lines a run returns when the stall watchdog stopped it: the exit code (-9) alone reads like an OOM
 # kill, and the retry cascade words its CPU hand-off by the real cause (``generator._gpu_hand_off``).
@@ -137,6 +147,8 @@ def create_ffmpeg_runner(
     chapter_start_ms: int | None = None,
     chapter_output: str | None = None,
     active_timeout_s: float | None = None,
+    claim_context: ClaimContext | None = None,
+    ephemeral_output: bool = False,
 ) -> Callable[..., tuple[int, float, float, list[str]]]:
     """Factory: return a configured ffmpeg-runner closure for one media item.
 
@@ -480,13 +492,74 @@ def create_ffmpeg_runner(
             f"ffmpeg_output_{os.getpid()}_{thread_id}_{time.time_ns()}.log",
         )
         stderr_fh = open(output_file, "w", encoding="utf-8")
+        # Initialised before the try so the finally below never masks an early
+        # failure (e.g. a claim-persistence error) with an UnboundLocalError.
+        stderr_reader = None
+        # Process ownership: a random per-child token is injected into the environment
+        # and persisted in the claim under config_dir; the child runs in its own
+        # session so cancel/pause/recovery signal its whole process group. Recovery
+        # after a restart only signals a PID whose token, procfs start time and argv
+        # hash all match — see processing/process_claims.py.
+        claim_token = new_claim_token()
+        child_env = dict(ffmpeg_env) if ffmpeg_env is not None else dict(os.environ)
+        child_env[CLAIM_ENV_VAR] = claim_token
+        claim = None
         try:
             proc = subprocess.Popen(
                 args,
                 stderr=stderr_fh,
                 stdout=subprocess.DEVNULL,
-                env=ffmpeg_env,
+                env=child_env,
+                start_new_session=True,
             )
+            ctx = claim_context or current_claim_context()
+            kind = (
+                "chapter" if chapter_start_ms is not None else (ctx.kind if ctx is not None and ctx.kind else "preview")
+            )
+            try:
+                raw_pid = proc.pid
+                try:
+                    pgid = get_process_group(raw_pid) if isinstance(raw_pid, int) else None
+                except Exception:  # defensive: never let group discovery break an extraction
+                    pgid = None
+                claim = get_claims_store().publish_claim(
+                    kind=kind,
+                    job_id=ctx.job_id if ctx is not None else None,
+                    worker=ctx.worker_record() if ctx is not None else {},
+                    ffmpeg_path=args[0] if args else (config.ffmpeg_path or ""),
+                    args=args,
+                    pid=proc.pid,
+                    pgid=pgid,
+                    output_folder=output_folder,
+                    stderr_log=output_file,
+                    ephemeral_output=ephemeral_output,
+                    token=claim_token,
+                )
+                claim.bind_process(proc)
+            except (ClaimPersistError, OSError) as claim_exc:
+                # An ownership record we cannot persist — including a claim
+                # store whose directory cannot even be created — would leave
+                # an unreclaimable orphan after a supervisor restart. Stop the
+                # just-spawned child rather than run an unowned ffmpeg; the
+                # normal per-file failure path records the file and the queue
+                # continues.
+                logger.error(
+                    "Could not publish the ownership record for the FFmpeg extracting {} ({}: {}). "
+                    "Stopping the just-started process and failing this file. "
+                    "Check that the config directory (CONFIG_DIR) is writable.",
+                    video_file,
+                    type(claim_exc).__name__,
+                    claim_exc,
+                )
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                if isinstance(claim_exc, ClaimPersistError):
+                    raise
+                # Normalise store-construction OSErrors to the abort callers understand.
+                raise ClaimPersistError(str(claim_exc)) from claim_exc
 
             # Signal that FFmpeg process has started
             if progress_callback:
@@ -501,7 +574,6 @@ def create_ffmpeg_runner(
             stalled = False
             gpu_cant_decode = False
             wrote_frame = False
-            stderr_reader = None
             unfinished_line = ""
 
             def remember(line: str) -> None:
@@ -517,6 +589,29 @@ def create_ffmpeg_runner(
                     ):
                         sticky_diagnostics.append(line)
 
+            def _group_signal(sig: int) -> None:
+                """Signal the owned process group (pause/SIGKILL); the handle falls back to the bound Popen."""
+                if claim is not None:
+                    claim.signal_group(sig)
+                    return
+                try:
+                    proc.send_signal(sig)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            def _detach_claim_reaper() -> None:
+                """Keep waiting (unbounded, off the worker thread) for an unconfirmed-dead FFmpeg, then revoke."""
+
+                def _reap_background() -> None:
+                    try:
+                        proc.wait()
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                    if claim is not None:
+                        claim.release_after_exit()
+
+                threading.Thread(target=_reap_background, name=f"ffmpeg-reap-{proc.pid}", daemon=True).start()
+
             def reap_killed_process() -> None:
                 """A blocked mount must not hold a chapter worker after SIGKILL."""
                 if active_timeout_s is None:
@@ -527,7 +622,12 @@ def create_ffmpeg_runner(
                 except subprocess.TimeoutExpired:
                     logger.warning("FFmpeg did not exit after termination for {}; cleanup is pending", video_file)
                     remember(PROCESS_EXIT_PENDING_LINE)
-                    threading.Thread(target=proc.wait, name=f"ffmpeg-reap-{proc.pid}", daemon=True).start()
+                    if claim is not None:
+                        claim.retain_with_todo(
+                            TODO_KILL_FAILED,
+                            "FFmpeg did not exit after SIGKILL (likely an uninterruptible mount read); cleanup pending",
+                        )
+                        _detach_claim_reaper()
 
             def read_new_stderr(*, process_exited: bool = False) -> list[str]:
                 """The lines FFmpeg has added to its stderr file since the last call, stripped, blank ones dropped.
@@ -608,19 +708,30 @@ def create_ffmpeg_runner(
                     active_tick = now_tick
                 if cancel_check and cancel_check():
                     logger.info("Cancellation requested, terminating FFmpeg for {}", video_file)
-                    # If we were paused, resume first so SIGTERM can be delivered.
-                    if paused_locally:
+                    if claim is not None:
+                        # One bounded, idempotent round (CONT first in case the
+                        # group is SIGSTOP-paused) against the whole group.
+                        result = claim.terminate_group(grace_s=5, kill_s=5)
+                        if result.exited:
+                            claim.release_after_exit()
+                        else:
+                            claim.retain_with_todo(
+                                TODO_KILL_FAILED,
+                                "cancelled FFmpeg was still unconfirmed after SIGKILL; cleanup pending",
+                            )
+                            _detach_claim_reaper()
+                    else:  # pragma: no cover - claim is always present on an un-failed spawn
+                        if paused_locally:
+                            try:
+                                proc.send_signal(signal.SIGCONT)
+                            except (ProcessLookupError, OSError):
+                                pass
+                        proc.terminate()
                         try:
-                            proc.send_signal(signal.SIGCONT)
-                        except (ProcessLookupError, OSError):
-                            pass
-                        paused_locally = False
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        reap_killed_process()
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            reap_killed_process()
                     raise CancellationError(f"Processing cancelled for {video_file}")
 
                 # Hard-pause via SIGSTOP/SIGCONT — freezes the FFmpeg process
@@ -634,31 +745,25 @@ def create_ffmpeg_runner(
                 # FFMPEG_STALL_TIMEOUT_SEC kill below.
                 if pause_check and pause_check():
                     if not paused_locally:
-                        try:
-                            proc.send_signal(signal.SIGSTOP)
-                            paused_locally = True
-                            last_progress_time = time.time()  # freeze stall clock
-                            logger.info(
-                                "FFmpeg paused for {} (PID {}) — global pause is active",
-                                video_file,
-                                proc.pid,
-                            )
-                        except (ProcessLookupError, OSError):
-                            pass
+                        _group_signal(signal.SIGSTOP)
+                        paused_locally = True
+                        last_progress_time = time.time()  # freeze stall clock
+                        logger.info(
+                            "FFmpeg paused for {} (PID {}) — global pause is active",
+                            video_file,
+                            proc.pid,
+                        )
                     time.sleep(0.2)
                     continue
                 if paused_locally:
-                    try:
-                        proc.send_signal(signal.SIGCONT)
-                        paused_locally = False
-                        last_progress_time = time.time()  # restart stall clock
-                        logger.info("FFmpeg resumed for {} (PID {})", video_file, proc.pid)
-                    except (ProcessLookupError, OSError):
-                        pass
+                    _group_signal(signal.SIGCONT)
+                    paused_locally = False
+                    last_progress_time = time.time()  # restart stall clock
+                    logger.info("FFmpeg resumed for {} (PID {})", video_file, proc.pid)
                 if active_timeout_s is not None and active_elapsed >= active_timeout_s:
                     logger.warning("FFmpeg exceeded its {}s active attempt limit for {}", active_timeout_s, video_file)
                     stalled = True
-                    proc.kill()
+                    _group_signal(signal.SIGKILL)
                     reap_killed_process()
                     remember(ACTIVE_TIMEOUT_LINE)
                     break
@@ -679,7 +784,7 @@ def create_ffmpeg_runner(
                 if active_timeout_s is not None and os.path.getsize(output_file) > _CHAPTER_STDERR_LIMIT:
                     logger.warning("FFmpeg exceeded its chapter diagnostic output limit for {}", video_file)
                     stalled = True
-                    proc.kill()
+                    _group_signal(signal.SIGKILL)
                     reap_killed_process()
                     remember(DIAGNOSTIC_LIMIT_LINE)
                     break
@@ -691,12 +796,13 @@ def create_ffmpeg_runner(
                         "FFmpeg fail on every frame to the end of the file.",
                         video_file,
                     )
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
+                    verdict_result = claim.terminate_group(grace_s=5, kill_s=5) if claim is not None else None
+                    if verdict_result is not None and not verdict_result.exited:
+                        claim.retain_with_todo(
+                            TODO_KILL_FAILED,
+                            "GPU-cant-decode stop: FFmpeg was still unconfirmed after SIGKILL; cleanup pending",
+                        )
+                        _detach_claim_reaper()
                     ffmpeg_output_lines.append(GPU_CANT_DECODE_LINE)
                     break
                 if time.time() - last_progress_time > FFMPEG_STALL_TIMEOUT_SEC:
@@ -710,7 +816,7 @@ def create_ffmpeg_runner(
                         video_file,
                     )
                     stalled = True
-                    proc.kill()
+                    _group_signal(signal.SIGKILL)
                     reap_killed_process()
                     remember(STALL_WATCHDOG_LINE)
                     break
@@ -723,6 +829,13 @@ def create_ffmpeg_runner(
                     total_duration = parse_ffmpeg_progress_line(line, total_duration, speed_capture_callback)
             except OSError:
                 pass
+            # Output has converged and the process is confirmed gone on every
+            # non-cancel path (natural exit, stall/limit/verdict stops). The one
+            # exception — SIGKILL with an unconfirmed exit on a dead mount — left
+            # the claim active plus a kill_failed TODO and a detached reaper that
+            # revokes it when the wait finally returns.
+            if claim is not None and proc.returncode is not None:
+                claim.release_after_exit()
         finally:
             # Ensure stderr file handle is always closed
             stderr_fh.close()

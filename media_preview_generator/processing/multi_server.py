@@ -2076,6 +2076,9 @@ def _process_canonical_path_previews(
                     ffmpeg_threads_override=ffmpeg_threads_override,
                     cancel_check=cancel_check,
                     pause_check=pause_check,
+                    # Only the ad-hoc (non-cache) tmp dir is ours to delete on
+                    # orphan recovery; cache slots outlive a single job.
+                    ephemeral_output=cleanup_path is not None,
                 )
             except CodecNotSupportedError as exc:
                 # Re-raised so callers can fall back to CPU; not a publisher failure. Worded by the real cause: a stall
@@ -2349,7 +2352,7 @@ def _process_canonical_path_previews(
         # Only clean up tmp dirs that are *not* in the cache. Cache
         # entries persist for TTL so subsequent webhooks hit them.
         if cleanup_path is not None:
-            _cleanup_temp_directory(cleanup_path)
+            _cleanup_temp_directory(cleanup_path, job_id=originating_job_id)
         # Release the generation lock so waiting concurrent dispatchers
         # for the same canonical path can wake up and hit the now-
         # populated cache.

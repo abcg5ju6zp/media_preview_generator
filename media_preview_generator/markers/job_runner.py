@@ -21,6 +21,7 @@ from ..jobs.orchestrator import _build_multi_server_registry
 from ..jobs.parking import JobParked, park_if_unavailable
 from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, unregister_job_thread
 from ..processing.generator import clear_failures, failure_scope, set_file_result_callback
+from ..processing.process_claims import ClaimContext, reset_claim_context, set_claim_context
 from ..processing.retry_queue import retry_policy, scaled_backoff_delay
 from ..processing.types import ProcessableItem
 from ..servers.base import ServerConfig
@@ -1359,6 +1360,8 @@ def _run_intro_credits_pass(job_id: str) -> bool | None:
         logger.info("Intro & Credits job {} not started — processing is paused; job stays pending", job_id)
         return
     register_job_thread(job_id)
+    # Chapter-frame FFmpeg spawned by this job thread publishes a claim with the job id.
+    claim_token = set_claim_context(ClaimContext(job_id=job_id))
     handler_id = loguru_logger.add(
         lambda message: jm.add_log(job_id, f"{message.record['level'].name} - {message.record['message']}"),
         level=str(settings.get("log_level", "INFO")).upper(),
@@ -1839,6 +1842,7 @@ def _run_intro_credits_pass(job_id: str) -> bool | None:
         except Exception as exc:
             logger.debug("Could not clear worker statuses after {}: {}", job_id, exc)
         unregister_job_thread()
+        reset_claim_context(claim_token)
         # After the slot is back, and outside the job's log: a skipped cleanup's warning isn't about this job.
         if sweep_store is not None:
             _start_fingerprint_sweep(cfg, sweep_store, sweep_configs)

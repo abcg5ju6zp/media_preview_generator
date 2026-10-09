@@ -34,10 +34,11 @@ TIMEZONE_MISCONFIGURED_ID = "timezone_misconfigured"
 SCHEMA_MIGRATION_ID = "schema_migration_completed"
 DEPRECATED_IMAGE_ID = "deprecated_docker_image_name"
 MEDIA_MOUNT_UNHEALTHY_ID = "media_mount_unhealthy"
+PROCESS_CLEANUP_ID = "process_cleanup_todos"
 
 # Cards that can be hidden until the next restart but never for good: the problem they report comes and goes, and a
 # permanent dismissal would hide the next occurrence too. An id stored by an older version is ignored.
-SESSION_ONLY_DISMISSAL_IDS = frozenset({MEDIA_MOUNT_UNHEALTHY_ID})
+SESSION_ONLY_DISMISSAL_IDS = frozenset({MEDIA_MOUNT_UNHEALTHY_ID, PROCESS_CLEANUP_ID})
 
 
 def is_session_only_dismissal(notification_id_value: str) -> bool:
@@ -333,6 +334,49 @@ def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
     return cards
 
 
+def _build_process_cleanup_notification() -> dict[str, Any] | None:
+    """One card when orphan-reconciliation left open cleanup TODOs (stuck processes / leftover temp dirs)."""
+    from markupsafe import escape
+
+    try:
+        from ..processing.process_claims import get_claims_store
+
+        todos = get_claims_store().list_todos("open")
+    except Exception:
+        return None
+    if not todos:
+        return None
+
+    counts: dict[str, int] = {}
+    for todo in todos:
+        kind = str(todo.get("kind") or "unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+    labels = {
+        "graceful_terminate_timeout": "didn't stop in time",
+        "kill_failed": "survived forced stop",
+        "cleanup_failed": "temp directory left behind",
+        "identity_unconfirmed": "identity could not be confirmed",
+    }
+    summary = ", ".join(f"{labels.get(k, k)} × {n}" for k, n in sorted(counts.items()))
+    body = (
+        f"<p class='mb-0'>{escape(str(len(todos)))} frame-extraction cleanup item(s) remain after a restart "
+        f"({escape(summary)}). The app deliberately did not signal any process whose identity could not be "
+        "fully verified.</p>"
+        "<p class='mb-0 mt-1'>"
+        "<a href='/logs#process-cleanup'>Review and recheck on Tools → Logs</a></p>"
+    )
+    return {
+        "id": PROCESS_CLEANUP_ID,
+        "severity": "warning",
+        "title": "Residual frame-extraction process or temp directory",
+        "body_html": body,
+        "dismissable": True,
+        "permanent_dismissable": False,
+        "source": "process_cleanup",
+        "count": len(todos),
+    }
+
+
 def _notification_sources() -> list[dict[str, Any] | None]:
     """All notification builders.  Add new sources here as they arrive."""
     return [
@@ -341,6 +385,7 @@ def _notification_sources() -> list[dict[str, Any] | None]:
         _build_schema_migration_notification(),
         _build_deprecated_image_notification(),
         _build_unhealthy_media_mounts_notification(),
+        _build_process_cleanup_notification(),
         *_build_gpu_keeps_failing_notifications(),
     ]
 

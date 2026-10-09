@@ -64,6 +64,64 @@ def get_timezone():
     return jsonify(_get_timezone_info())
 
 
+# ---------------------------------------------------------------------------
+# Process ownership / orphan-cleanup TODOs
+# ---------------------------------------------------------------------------
+
+
+@api.route("/system/process-cleanup")
+@setup_or_auth_required
+def get_process_cleanup():
+    """Open cleanup TODOs, in-flight claim summaries and the most recent boot-recovery summary.
+
+    Never exposes argv, the claim token or environment contents.
+    """
+    from ...processing.process_claims import get_claims_store
+
+    try:
+        store = get_claims_store()
+        return jsonify(
+            {
+                "todos": store.list_todos("open"),
+                "active_claims": store.active_claim_summaries(),
+                "last_recovery": store.last_recovery,
+            }
+        )
+    except Exception as exc:
+        logger.warning("process-cleanup status failed ({}: {})", type(exc).__name__, exc)
+        return jsonify({"todos": [], "active_claims": [], "last_recovery": None, "error": str(exc)}), 200
+
+
+@api.route("/system/process-cleanup/reconcile", methods=["POST"])
+@setup_or_auth_required
+def post_process_cleanup_reconcile():
+    """Recheck claims/TODOs now: reclaims live orphans and auto-resolves items whose condition cleared."""
+    from ...processing.process_claims import reconcile_cleanup_todos
+
+    try:
+        result = reconcile_cleanup_todos()
+    except Exception as exc:
+        logger.warning("process-cleanup reconcile failed ({}: {})", type(exc).__name__, exc)
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(result)
+
+
+@api.route("/system/process-cleanup/<todo_id>/resolve", methods=["POST"])
+@setup_or_auth_required
+def post_process_cleanup_resolve(todo_id: str):
+    """Manually dismiss one open cleanup TODO (e.g. after deleting the path on the host)."""
+    from ...processing.process_claims import get_claims_store
+
+    try:
+        record = get_claims_store().resolve_todo(todo_id, "manually dismissed")
+    except Exception as exc:
+        logger.warning("process-cleanup resolve failed ({}: {})", type(exc).__name__, exc)
+        return jsonify({"error": str(exc)}), 500
+    if record is None:
+        return jsonify({"error": "unknown todo"}), 404
+    return jsonify({"id": todo_id, "status": record.get("status")})
+
+
 @api.route("/system/notifications")
 def list_notifications():
     """Return active system notifications for the bell-icon dropdown.

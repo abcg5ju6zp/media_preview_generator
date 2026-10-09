@@ -3734,30 +3734,52 @@ class TestCancellation:
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
-        # First wait() (after terminate) raises TimeoutExpired to force
-        # the kill escalation; second wait() (after kill) returns cleanly.
-        mock_proc.wait.side_effect = [_subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5), None]
+
+        # wait() raises TimeoutExpired until kill() lands — the claim handle
+        # polls the bound process in small slices rather than one 5 s wait.
+        def _wait(timeout=None):
+            if mock_proc.kill.called:
+                return None
+            raise _subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout)
+
+        mock_proc.wait.side_effect = _wait
         mock_popen.return_value = mock_proc
 
         mock_exists.return_value = False
+        # Burn the handle's bounded grace/kill clocks instantly for the test.
+        from media_preview_generator.processing import process_claims as _pc
 
-        with pytest.raises(CancellationError):
-            generate_images(
-                "/test/video.mp4",
-                temp_dir,
-                None,
-                None,
-                mock_config,
-                cancel_check=lambda: True,
+        fast_clock = {"t": 0.0}
+        from unittest.mock import patch as _patch
+
+        clock_patches = [
+            _patch.object(_pc, "_monotonic", lambda: fast_clock["t"]),
+            _patch.object(_pc, "_sleep", lambda s: fast_clock.__setitem__("t", fast_clock["t"] + max(0.0, s))),
+        ]
+        for p in clock_patches:
+            p.start()
+
+        try:
+            with pytest.raises(CancellationError):
+                generate_images(
+                    "/test/video.mp4",
+                    temp_dir,
+                    None,
+                    None,
+                    mock_config,
+                    cancel_check=lambda: True,
+                )
+
+            mock_proc.terminate.assert_called_once()
+            (
+                mock_proc.kill.assert_called_once(),
+                ("terminate() timed out → kill() escalation missing; FFmpeg would leak indefinitely"),
             )
-
-        mock_proc.terminate.assert_called_once()
-        (
-            mock_proc.kill.assert_called_once(),
-            ("terminate() timed out → kill() escalation missing; FFmpeg would leak indefinitely"),
-        )
-        # And the wait() after kill MUST be called (otherwise we leak a zombie).
-        assert mock_proc.wait.call_count >= 2, "wait() must be called again after kill() to reap the zombie"
+            # And wait() after kill MUST be called (otherwise we leak a zombie).
+            assert mock_proc.wait.call_count >= 2, "wait() must be called again after kill() to reap the zombie"
+        finally:
+            for p in clock_patches:
+                p.stop()
 
 
 class TestFailureScope:

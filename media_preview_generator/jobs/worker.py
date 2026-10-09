@@ -26,6 +26,7 @@ from ..processing.generator import (
     failure_scope,
     gpu_fallback_advice,
 )
+from ..processing.process_claims import ClaimContext, reset_claim_context, set_claim_context
 from ..utils import format_display_title, redact_secrets, redacted_traceback
 from .gpu_fallback import get_gpu_fallback_tracker
 from .worker_naming import friendly_device_label
@@ -467,9 +468,11 @@ class Worker:
         :meth:`_process_custom_item` instead.
         """
         if self.process_fn is not None:
+            claim_token = set_claim_context(self.claim_context())
             try:
                 self._process_custom_item(item, progress_callback)
             finally:
+                reset_claim_context(claim_token)
                 # Like the dispatcher's check threads: a later thread reusing this ident mustn't log into this job.
                 unregister_job_thread()
                 if self._done_event is not None:
@@ -485,6 +488,8 @@ class Worker:
         # log handler captures only its own messages — not a sibling job
         # running concurrently (D5).
         with job_thread(self.current_job_id), failure_scope(self.current_job_id):
+            # Ownership identity carried by every extraction FFmpeg this thread spawns.
+            claim_token = set_claim_context(self.claim_context())
             display_name = self.media_file or self.media_title or item.canonical_path
 
             ctx_logger = logger.bind(
@@ -752,9 +757,22 @@ class Worker:
                 _persist(ProcessingResult.FAILED, str(exc) or type(exc).__name__)
             finally:
                 # Counters are final by here; the dispatcher reads them once this thread has exited.
+                reset_claim_context(claim_token)
                 if self._done_event is not None:
                     self._done_event.set()
                 self._record_gpu_file(gpu_decoded=gpu_decoded, cancelled=cancelled)
+
+    def claim_context(self) -> ClaimContext:
+        """Job/worker identity published with this worker's external extraction processes."""
+        return ClaimContext(
+            job_id=self.current_job_id,
+            worker_id=self.worker_id,
+            worker_type=self.worker_type,
+            worker_name=self.display_name,
+            gpu=self.gpu,
+            gpu_device=self.gpu_device,
+            group_id=self.group_id,
+        )
 
     def _record_gpu_file(self, *, gpu_decoded: bool, cancelled: bool) -> None:
         """Count a finished file for this GPU's fallback streak and the job's CPU-fallback tally.
